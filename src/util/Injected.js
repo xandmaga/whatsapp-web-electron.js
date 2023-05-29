@@ -54,6 +54,8 @@ exports.ExposeStore = (moduleRaidStr) => {
     window.Store.QuotedMsg = window.mR.findModule('getQuotedMsgObj')[0];
     window.Store.Socket = window.mR.findModule('deprecatedSendIq')[0];
     window.Store.SocketWap = window.mR.findModule('wap')[0];
+    window.Store.SearchContext = window.mR.findModule('getSearchContext')[0].getSearchContext;
+    window.Store.DrawerManager = window.mR.findModule('DrawerManager')[0].DrawerManager;
     window.Store.StickerTools = {
         ...window.mR.findModule('toWebpSticker')[0],
         ...window.mR.findModule('addWebpMetadata')[0]
@@ -117,7 +119,10 @@ exports.LoadUtils = () => {
                     forceDocument: options.sendMediaAsDocument,
                     forceGif: options.sendVideoAsGif
                 });
-
+            
+            if (options.caption){
+                attOptions.caption = options.caption; 
+            }
             content = options.sendMediaAsSticker ? undefined : attOptions.preview;
 
             delete options.attachment;
@@ -243,11 +248,12 @@ exports.LoadUtils = () => {
 
         const meUser = window.Store.User.getMaybeMeUser();
         const isMD = window.Store.MDBackend;
-
+        const newId = await window.Store.MsgKey.newId();
+        
         const newMsgId = new window.Store.MsgKey({
             from: meUser,
             to: chat.id,
-            id: window.Store.MsgKey.newId(),
+            id: newId,
             participant: isMD && chat.id.isGroup() ? meUser : undefined,
             selfDir: 'out',
         });
@@ -272,6 +278,7 @@ exports.LoadUtils = () => {
             ...ephemeralFields,
             ...locationOptions,
             ...attOptions,
+            ...(attOptions.toJSON ? attOptions.toJSON() : {}),
             ...quotedMsgOptions,
             ...vcardOptions,
             ...buttonOptions,
@@ -427,7 +434,15 @@ exports.LoadUtils = () => {
             await window.Store.GroupMetadata.update(chatWid);
             res.groupMetadata = chat.groupMetadata.serialize();
         }
-
+        
+        res.lastMessage = null;
+        if (res.msgs && res.msgs.length) {
+            const lastMessage = window.Store.Msg.get(chat.lastReceivedKey._serialized);
+            if (lastMessage) {
+                res.lastMessage = window.WWebJS.getMessageModel(lastMessage);
+            }
+        }
+        
         delete res.msgs;
         delete res.msgUnsyncedButtonReplyMsgs;
         delete res.unsyncedButtonReplies;
