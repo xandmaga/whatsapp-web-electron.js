@@ -85,184 +85,6 @@ class Client extends EventEmitter {
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
 
-    async inject(reinject = false) {
-        await this.pupPage.waitForFunction('window.Debug?.VERSION != undefined', {timeout: this.options.authTimeoutMs});
-
-        const version = await this.getWWebVersion();
-        const isCometOrAbove = parseInt(version.split('.')?.[1]) >= 3000;
-
-        if (isCometOrAbove) {
-            await this.pupPage.evaluate(ExposeAuthStore);
-        } else {
-            await this.pupPage.evaluate(ExposeLegacyAuthStore, moduleRaid.toString());
-        }
-
-        const needAuthentication = await this.pupPage.evaluate(async () => {
-            let state = window.AuthStore.AppState.state;
-
-            if (state === 'OPENING' || state === 'UNLAUNCHED' || state === 'PAIRING') {
-                // wait till state changes
-                await new Promise(r => {
-                    window.AuthStore.AppState.on('change:state', function waitTillInit(_AppState, state) {
-                        if (state !== 'OPENING' && state !== 'UNLAUNCHED' && state !== 'PAIRING') {
-                            window.AuthStore.AppState.off('change:state', waitTillInit);
-                            r();
-                        } 
-                    });
-                }); 
-            }
-            state = window.AuthStore.AppState.state;
-            return state == 'UNPAIRED' || state == 'UNPAIRED_IDLE';
-        });
-
-        if (needAuthentication) {
-            const { failed, failureEventPayload, restart } = await this.authStrategy.onAuthenticationNeeded();
-
-            if(failed) {
-                /**
-                 * Emitted when there has been an error while trying to restore an existing session
-                 * @event Client#auth_failure
-                 * @param {string} message
-                 */
-                this.emit(Events.AUTHENTICATION_FAILURE, failureEventPayload);
-                await this.destroy();
-                if (restart) {
-                    // session restore failed so try again but without session to force new authentication
-                    return this.initialize();
-                }
-                return;
-            }
-
-            // Register qr events
-            let qrRetries = 0;
-            const injected = await this.pupPage.evaluate(() => {
-                return typeof window.onQRChangedEvent !== 'undefined';
-            });
-            if (!injected) {
-                await this.pupPage.exposeFunction('onQRChangedEvent', async (qr) => {
-                    /**
-                    * Emitted when a QR code is received
-                    * @event Client#qr
-                    * @param {string} qr QR Code
-                    */
-                    this.emit(Events.QR_RECEIVED, qr);
-                    if (this.options.qrMaxRetries > 0) {
-                        qrRetries++;
-                        if (qrRetries > this.options.qrMaxRetries) {
-                            this.emit(Events.DISCONNECTED, 'Max qrcode retries reached');
-                            await this.destroy();
-                        }
-                    }
-                });
-            }
-
-
-            await this.pupPage.evaluate(async () => {
-                const registrationInfo = await window.AuthStore.RegistrationUtils.waSignalStore.getRegistrationInfo();
-                const noiseKeyPair = await window.AuthStore.RegistrationUtils.waNoiseInfo.get();
-                const staticKeyB64 = window.AuthStore.Base64Tools.encodeB64(noiseKeyPair.staticKeyPair.pubKey);
-                const identityKeyB64 = window.AuthStore.Base64Tools.encodeB64(registrationInfo.identityKeyPair.pubKey);
-                const advSecretKey = await window.AuthStore.RegistrationUtils.getADVSecretKey();
-                const platform =  window.AuthStore.RegistrationUtils.DEVICE_PLATFORM;
-                const getQR = (ref) => ref + ',' + staticKeyB64 + ',' + identityKeyB64 + ',' + advSecretKey + ',' + platform;
-                
-                window.onQRChangedEvent(getQR(window.AuthStore.Conn.ref)); // initial qr
-                window.AuthStore.Conn.on('change:ref', (_, ref) => { window.onQRChangedEvent(getQR(ref)); }); // future QR changes
-            });
-        }
-
-        if (!reinject) {
-            await this.pupPage.exposeFunction('onAuthAppStateChangedEvent', async (state) => {
-                if (state == 'UNPAIRED_IDLE') {
-                    // refresh qr code
-                    window.Store.Cmd.refreshQR();
-                }
-            });
-
-            await this.pupPage.exposeFunction('onAppStateHasSyncedEvent', async () => {
-                const authEventPayload = await this.authStrategy.getAuthEventPayload();
-                /**
-                 * Emitted when authentication is successful
-                 * @event Client#authenticated
-                 */
-                this.emit(Events.AUTHENTICATED, authEventPayload);
-
-                const injected = await this.pupPage.evaluate(async () => {
-                    return typeof window.Store !== 'undefined' && typeof window.WWebJS !== 'undefined';
-                });
-
-                if (!injected) {
-                    if (this.options.webVersionCache.type === 'local' && this.currentIndexHtml) {
-                        const { type: webCacheType, ...webCacheOptions } = this.options.webVersionCache;
-                        const webCache = WebCacheFactory.createWebCache(webCacheType, webCacheOptions);
-            
-                        await webCache.persist(this.currentIndexHtml, version);
-                    }
-
-                    if (isCometOrAbove) {
-                        await this.pupPage.evaluate(ExposeStore);
-                    } else {
-                        // make sure all modules are ready before injection
-                        // 2 second delay after authentication makes sense and does not need to be made dyanmic or removed
-                        await new Promise(r => setTimeout(r, 2000)); 
-                        await this.pupPage.evaluate(ExposeLegacyStore);
-                    }
-
-                    // Check window.Store Injection
-                    await this.pupPage.waitForFunction('window.Store != undefined');
-            
-                    /**
-                     * Current connection information
-                     * @type {ClientInfo}
-                     */
-                    this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
-                        return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMeUser() };
-                    }));
-
-                    this.interface = new InterfaceController(this);
-
-                    //Load util functions (serializers, helper functions)
-                    await this.pupPage.evaluate(LoadUtils);
-
-                    await this.attachEventListeners(reinject);
-                    reinject = true;
-                }
-                /**
-                 * Emitted when the client has initialized and is ready to receive messages.
-                 * @event Client#ready
-                 */
-                this.emit(Events.READY);
-                this.authStrategy.afterAuthReady();
-            });
-            let lastPercent = null;
-            await this.pupPage.exposeFunction('onOfflineProgressUpdateEvent', async (percent) => {
-                if (lastPercent !== percent) {
-                    lastPercent = percent;
-                    this.emit(Events.LOADING_SCREEN, percent, 'WhatsApp'); // Message is hardcoded as "WhatsApp" for now
-                }
-            });
-        }
-        const logoutCatchInjected = await this.pupPage.evaluate(() => {
-            return typeof window.onLogoutEvent !== 'undefined';
-        });
-        if (!logoutCatchInjected) {
-            await this.pupPage.exposeFunction('onLogoutEvent', async () => {
-                this.lastLoggedOut = true;
-                await this.pupPage.waitForNavigation({waitUntil: 'load', timeout: 5000}).catch((_) => _);
-            });
-        }
-        await this.pupPage.evaluate(() => {
-            window.AuthStore.AppState.on('change:state', (_AppState, state) => { window.onAuthAppStateChangedEvent(state); });
-            window.AuthStore.AppState.on('change:hasSynced', () => { window.onAppStateHasSyncedEvent(); });
-            window.AuthStore.Cmd.on('offline_progress_update', () => {
-                window.onOfflineProgressUpdateEvent(window.AuthStore.OfflineMessageHandler.getOfflineDeliveryProgress()); 
-            });
-            window.AuthStore.Cmd.on('logout', async () => {
-                await window.onLogoutEvent();
-            });
-        });
-    }
-
     /**
      * Injection logic
      * Private function
@@ -451,22 +273,10 @@ class Client extends EventEmitter {
      */
     async initialize() {
 
-        let 
-            /**
-             * @type {puppeteer.Browser}
-             */
-            browser, 
-            /**
-             * @type {puppeteer.Page}
-             */
-            page;
 
-        browser = null;
-        page = null;
+        //await this.authStrategy.beforeBrowserInitialized();
 
-        await this.authStrategy.beforeBrowserInitialized();
-
-        const puppeteerOpts = this.options.puppeteer;
+        /*const puppeteerOpts = this.options.puppeteer;
         if (puppeteerOpts && puppeteerOpts.browserWSEndpoint) {
             browser = await puppeteer.connect(puppeteerOpts);
             page = await browser.newPage();
@@ -480,16 +290,20 @@ class Client extends EventEmitter {
 
             browser = await puppeteer.launch({...puppeteerOpts, args: browserArgs});
             page = (await browser.pages())[0];
-        }
+        }*/
+
+        const page = await pie.getPage(this.pupBrowser, this.browserWindow);
+        await page.setUserAgent(this.options.userAgent);
+        if (this.options.bypassCSP) await page.setBypassCSP(true);
 
         if (this.options.proxyAuthentication !== undefined) {
             await page.authenticate(this.options.proxyAuthentication);
         }
       
-        await page.setUserAgent(this.options.userAgent);
-        if (this.options.bypassCSP) await page.setBypassCSP(true);
+        //await page.setUserAgent(this.options.userAgent);
+        //if (this.options.bypassCSP) await page.setBypassCSP(true);
 
-        this.pupBrowser = browser;
+        //this.pupBrowser = browser;
         this.pupPage = page;
 
         await this.authStrategy.afterBrowserInitialized();
